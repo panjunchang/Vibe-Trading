@@ -1,12 +1,15 @@
-"""Web search tool: free multi-engine search via ddgs (no API key).
+"""Web search tool: Tavily-preferred search with ddgs free-engine fallback.
 
-`ddgs` (the successor to `duckduckgo_search`) is a metasearch aggregator: it can
-query DuckDuckGo, Google, Bing, Brave, Mojeek, Yahoo and more behind one API,
-none of which need an API key.  DuckDuckGo alone rate-limits aggressively from
-cloud / shared IPs (issue #231: ``web_search`` showed ❌ while the run still
-succeeded via ``read_url``), so we pass an explicit ordered backend list and let
-ddgs fall through a throttled engine to the next one, with a short retry/backoff
-on top for transient failures.
+When ``TAVILY_API_KEY`` is configured and ``tavily-python`` is installed,
+Tavily (https://tavily.com) is used as the **preferred** (first-tried) search
+source.  If Tavily is unavailable or its request fails, the tool falls back to
+the ``ddgs`` metasearch aggregator, which queries DuckDuckGo, Google, Bing,
+Brave, Mojeek, Yahoo and more without requiring any API key.
+
+DuckDuckGo alone rate-limits aggressively from cloud / shared IPs (issue #231),
+so the fallback passes an explicit ordered backend list and retries with backoff
+to improve resilience.  Override the backend list via
+``VIBE_TRADING_SEARCH_BACKENDS``.
 """
 
 from __future__ import annotations
@@ -29,6 +32,36 @@ _DEFAULT_BACKENDS = "duckduckgo, google, bing, brave, mojeek, yahoo"
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.8
 
+_TAVILY_KEY_PLACEHOLDERS = {"", "your-tavily-api-key"}
+
+
+def _tavily_available() -> bool:
+    """Return True if tavily-python is installed and TAVILY_API_KEY is configured."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec("tavily") is None:
+            return False
+    except Exception:
+        return False
+    key = os.getenv("TAVILY_API_KEY", "").strip()
+    return key not in _TAVILY_KEY_PLACEHOLDERS
+
+
+def _search_via_tavily(query: str, max_results: int) -> list[dict]:
+    """Run a Tavily search and return results in the standard title/url/snippet format."""
+    from tavily import TavilyClient  # type: ignore[import-untyped]
+
+    client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    response = client.search(query, max_results=max_results)
+    return [
+        {
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", ""),
+        }
+        for r in response.get("results", [])
+    ]
+
 
 class WebSearchTool(BaseTool):
     """Search the web via ddgs across several free engines and return top results."""
@@ -47,9 +80,10 @@ class WebSearchTool(BaseTool):
         except ImportError:
             return False
     description = (
-        "Search the web across free engines (DuckDuckGo, Google, Bing, Brave, "
-        "Mojeek, Yahoo). Returns top results with title, URL, and snippet. Use "
-        "this to find information, news, or URLs before reading them with read_url."
+        "Search the web using Tavily as the preferred source when configured, "
+        "falling back to free engines (DuckDuckGo, Google, Bing, Brave, Mojeek, Yahoo) "
+        "when Tavily is unavailable. Returns top results with title, URL, and snippet. "
+        "Use this to find information, news, or URLs before reading them with read_url."
     )
     parameters = {
         "type": "object",
@@ -69,19 +103,38 @@ class WebSearchTool(BaseTool):
     repeatable = True
 
     def execute(self, **kwargs: Any) -> str:
-        """Run a web search across free engines with retry and backend fallback.
+        """Run a web search, preferring Tavily when configured, falling back to ddgs.
 
         Args:
             **kwargs: Must include query; optionally max_results.
 
         Returns:
-            JSON envelope with status, query, the backend list used, and results
+            JSON envelope with status, query, the backend used, and results
             (or an actionable error message on persistent failure).
         """
         query = kwargs["query"]
         max_results = min(int(kwargs.get("max_results", 5)), 10)
         backends = os.getenv("VIBE_TRADING_SEARCH_BACKENDS", _DEFAULT_BACKENDS).strip() or "auto"
 
+        # Tavily is the preferred search source when configured — try it first.
+        if _tavily_available():
+            try:
+                results = _search_via_tavily(query, max_results)
+                payload: dict = {
+                    "status": "ok",
+                    "query": query,
+                    "backends": "tavily",
+                    "results": results,
+                }
+                payload = with_security_warnings(
+                    payload,
+                    fields=("results.*.title", "results.*.snippet"),
+                )
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("web_search Tavily (preferred) failed, falling back to ddgs: %s", exc)
+
+        # Fall back to ddgs free backends.
         try:
             from ddgs import DDGS
 
