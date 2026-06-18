@@ -467,6 +467,7 @@ export function Settings() {
                   placeholder={tavilyStatus}
                   autoComplete="off"
                   disabled={clearTavilyApiKey}
+                />
               </div>
               <div className="flex items-center justify-between gap-3">
                 <span className={hintClass}>{"Preferred search source when configured. Free backends (DuckDuckGo, Google, Bing, etc.) are used as fallback. Get a key at tavily.com."}</span>
