@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Free, no-key engines aggregated by ddgs, tried in order. A single engine
 # returning nothing or being rate-limited no longer fails the whole search.
 # Override (or pin to one engine) via VIBE_TRADING_SEARCH_BACKENDS.
-_DEFAULT_BACKENDS = "duckduckgo, google, bing, brave, mojeek, yahoo"
+_DEFAULT_BACKENDS = "tavily, duckduckgo, google, bing, brave, mojeek, yahoo"
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SECONDS = 0.8
 
@@ -70,7 +70,7 @@ class WebSearchTool(BaseTool):
 
     @classmethod
     def check_available(cls) -> bool:
-        """Available only if ddgs or duckduckgo_search is installed."""
+        """Available if ddgs is installed. Tavily is used if API key present."""
         try:
             try:
                 import ddgs  # noqa: F401
@@ -80,10 +80,11 @@ class WebSearchTool(BaseTool):
         except ImportError:
             return False
     description = (
-        "Search the web using Tavily as the preferred source when configured, "
-        "falling back to free engines (DuckDuckGo, Google, Bing, Brave, Mojeek, Yahoo) "
-        "when Tavily is unavailable. Returns top results with title, URL, and snippet. "
-        "Use this to find information, news, or URLs before reading them with read_url."
+        "Search the web across several engines (Tavily, DuckDuckGo, Google, Bing, "
+        "Brave, Mojeek, Yahoo). Returns top results with title, URL, and snippet. "
+        "Tavily is preferred for stability and financial depth if TAVILY_API_KEY "
+        "is configured, falling back to free engines when unavailable. Use this to "
+        "find information, news, or URLs before reading them with read_url."
     )
     parameters = {
         "type": "object",
@@ -114,7 +115,47 @@ class WebSearchTool(BaseTool):
         """
         query = kwargs["query"]
         max_results = min(int(kwargs.get("max_results", 5)), 10)
-        backends = os.getenv("VIBE_TRADING_SEARCH_BACKENDS", _DEFAULT_BACKENDS).strip() or "auto"
+        backends_raw = os.getenv("VIBE_TRADING_SEARCH_BACKENDS", _DEFAULT_BACKENDS)
+        backends_list = [b.strip().lower() for b in backends_raw.split(",") if b.strip()]
+
+        # 1. Try Tavily first if it's in the backend list and configured
+        if "tavily" in backends_list:
+            api_key = os.environ.get("TAVILY_API_KEY", "")
+            if api_key:
+                try:
+                    from tavily import TavilyClient
+
+                    # We don't loop here; if Tavily is configured but fails,
+                    # we log and move to the ddgs fallback list.
+                    client = TavilyClient(api_key=api_key)
+                    # Use 'search' for general results, similar to ddgs
+                    response = client.search(query=query, max_results=max_results)
+                    results = [
+                        {
+                            "title": r.get("title", ""),
+                            "url": r.get("url", ""),
+                            "snippet": r.get("content", ""),
+                        }
+                        for r in response.get("results", [])
+                    ]
+                    if results:
+                        payload = {
+                            "status": "ok",
+                            "query": query,
+                            "backends": "tavily",
+                            "results": results,
+                        }
+                        payload = with_security_warnings(
+                            payload,
+                            fields=("results.*.title", "results.*.snippet"),
+                        )
+                        return json.dumps(payload, ensure_ascii=False)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Tavily search failed, falling back: %s", exc)
+
+        # 2. Preparation for ddgs fallback
+        # Remove 'tavily' from list for ddgs param and join back
+        ddgs_backends = ", ".join([b for b in backends_list if b != "tavily"]) or "auto"
 
         # Tavily is the preferred search source when configured — try it first.
         if _tavily_available():
@@ -157,7 +198,7 @@ class WebSearchTool(BaseTool):
             try:
                 with DDGS() as client:
                     if supports_backend:
-                        raw = list(client.text(query, max_results=max_results, backend=backends))
+                        raw = list(client.text(query, max_results=max_results, backend=ddgs_backends))
                     else:
                         raw = list(client.text(query, max_results=max_results))
             except TypeError:
@@ -173,7 +214,7 @@ class WebSearchTool(BaseTool):
                         {
                             "status": "ok",
                             "query": query,
-                            "backends": backends if supports_backend else "duckduckgo",
+                            "backends": ddgs_backends if supports_backend else "duckduckgo",
                             "results": [],
                             "note": "No results found for this query across the search engines.",
                         },
@@ -195,7 +236,7 @@ class WebSearchTool(BaseTool):
             payload = {
                 "status": "ok",
                 "query": query,
-                "backends": backends if supports_backend else "duckduckgo",
+                "backends": ddgs_backends if supports_backend else "duckduckgo",
                 "results": results,
             }
             payload = with_security_warnings(
@@ -209,7 +250,7 @@ class WebSearchTool(BaseTool):
                 "status": "error",
                 "error": (
                     f"Web search failed after {_MAX_ATTEMPTS} attempts "
-                    f"(backends: {backends if supports_backend else 'duckduckgo'}): {last_error}. "
+                    f"(backends: {ddgs_backends if supports_backend else 'duckduckgo'}): {last_error}. "
                     "Free search engines rate-limit aggressively from cloud/shared IPs — "
                     "retry shortly, set VIBE_TRADING_SEARCH_BACKENDS to a different engine "
                     "list (e.g. 'google, bing'), or read a known URL directly with read_url."
